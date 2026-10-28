@@ -21,6 +21,7 @@
 #   --ssh-port PORT     port to probe on the robot (default 22)
 #   --linger SECS       how long to keep the beacon server up (default 25)
 #   --timeout SECS      how long to wait for SSH (default 120)
+#   --no-serve          the scripts are already served at HOST:HTTP_PORT (skip the local server)
 #   --dry-run           print the payload and exit
 #
 # Exit codes: 0 SSH reachable, 1 failure, 2 usage, 3 published but SSH closed.
@@ -40,6 +41,7 @@ BEACON_PORT=8883
 SSH_PORT=22
 LINGER=0
 WAIT=120
+SERVE=1
 DRY_RUN=0
 
 die() { printf 'error: %s\n' "$*" >&2; exit 1; }
@@ -59,6 +61,7 @@ while [ $# -gt 0 ]; do
         --ssh-port)    SSH_PORT="$2"; shift 2 ;;
         --linger)      LINGER="$2"; shift 2 ;;
         --timeout)     WAIT="$2"; shift 2 ;;
+        --no-serve)    SERVE=0; shift ;;
         --dry-run)     DRY_RUN=1; shift ;;
         -h|--help)     usage ;;
         -*)            die "unknown option $1" ;;
@@ -132,10 +135,15 @@ cleanup() {
 }
 trap cleanup EXIT
 
-( cd "$SCRIPTS_DIR" && exec "$PY" -m http.server "$HTTP_PORT" --bind 0.0.0.0 ) >"$LOG.http" 2>&1 &
-HTTP_PID=$!
-sleep 1
-kill -0 "$HTTP_PID" 2>/dev/null || die "HTTP server on :$HTTP_PORT failed (port busy?)"
+if [ "$SERVE" = 1 ]; then
+    ( cd "$SCRIPTS_DIR" && exec "$PY" -m http.server "$HTTP_PORT" --bind 0.0.0.0 ) >"$LOG.http" 2>&1 &
+    HTTP_PID=$!
+    sleep 1
+    kill -0 "$HTTP_PID" 2>/dev/null || die "HTTP server on :$HTTP_PORT failed (port busy?)"
+else
+    echo "serving      : external (expecting $HOST_IP:$HTTP_PORT already up)"
+    : >"$LOG.http"
+fi
 
 # --- publish ------------------------------------------------------------------
 echo "publishing via ${ROBOT}:8883 ..."

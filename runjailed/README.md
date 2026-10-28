@@ -56,6 +56,16 @@ Options: `--blid`, `--password`, `--host-ip`, `--http-port` (8899),
 interpreter if the default one lacks `paho-mqtt`
 (`pip install -r runjailed/requirements.txt`).
 
+With `--no-serve` the script does not start a local file server and expects
+`HOST:HTTP_PORT` to serve `runjailed/scripts/` already, e.g.:
+
+```sh
+./runjailed/oneclick-ssh.sh <ROBOT-IP> --host-ip michaelbeetz.de --http-port 8899 --no-serve
+```
+
+The robot then fetches the script from the public host and beacons back to
+`HOST:BEACON_PORT`, which must be reachable from the robot as well.
+
 Exit codes: `0` SSH reachable, `3` payload ran as root but the port is still
 closed (the firewall picks up `SYSTEM_ACCESS="unlocked"` on the next start of
 the connectivity services — reboot the robot and retry), `1` failure, `2` usage.
