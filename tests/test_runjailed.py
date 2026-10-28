@@ -157,6 +157,7 @@ def test_on_connect_publishes_pending_urls_once_and_disconnects():
     module.mqttc.publish.return_value = SimpleNamespace(rc=mqtt.MQTT_ERR_SUCCESS)
     module.PENDING_URLS[:] = ["https://example.org/a", "https://example.org/b"]
     module.SEND_DELAY = 0
+    module.LINGER = 0
     client = Mock()
 
     with patch("threading.Thread") as thread:
@@ -178,3 +179,12 @@ def test_on_message_ignores_non_json_payloads_and_other_topics():
     module.on_message(module.mqttc, None, SimpleNamespace(topic="$aws/things/x/shadow/update", payload=b"not json"))
 
     module.mqttc.publish.assert_not_called()
+
+
+def test_enable_ssh_url_passes_beacon_port_to_the_remote_script():
+    module = load_script()
+
+    url = module.enableSshUrl("10.0.0.5", 8899, 8887)
+
+    assert "sh /tmp/e 10.0.0.5 8899 8887" in url
+    assert len(url.encode()) <= 191
