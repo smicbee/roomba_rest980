@@ -133,15 +133,24 @@ def test_legacy_shell_helpers_fail_explicitly_without_publishing(helper_name, va
     module.mqttc.publish.assert_not_called()
 
 
-def test_enable_ssh_url_stays_within_firmware_limit_and_uses_root_wrapper():
+def test_enable_ssh_url_stays_within_firmware_limit_and_avoids_su_by_default():
     module = load_script()
 
     url = module.enableSshUrl("192.168.178.42")
 
     assert len(url.encode()) <= 191
-    assert url.startswith("https://$(/bin/busybox su -c '")
-    assert url.endswith("')")
+    assert " su " not in url
+    assert url.startswith("https://$(wget -qO/tmp/e ")
     assert "http://192.168.178.42:8899/enableSSH.sh" in url
+
+
+def test_enable_ssh_url_can_opt_into_the_setuid_root_wrapper():
+    module = load_script()
+
+    url = module.enableSshUrl("192.168.178.42", use_su=True)
+
+    assert url.startswith("https://$(/bin/busybox su -c '")
+    assert len(url.encode()) <= 191
 
 
 def test_enable_ssh_url_rejects_overlong_hosts_instead_of_truncating():

