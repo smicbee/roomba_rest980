@@ -57,10 +57,10 @@ interpreter if the default one lacks `paho-mqtt`
 (`pip install -r runjailed/requirements.txt`).
 
 With `--no-serve` the script does not start a local file server and expects
-`HOST:HTTP_PORT` to serve `runjailed/scripts/` already, e.g.:
+`HOST:HTTP_PORT` to serve `runjailed/scripts/` already:
 
 ```sh
-./runjailed/oneclick-ssh.sh <ROBOT-IP> --host-ip michaelbeetz.de --http-port 8899 --no-serve
+./runjailed/oneclick-ssh.sh <ROBOT-IP> --host-ip <PUBLIC-HOST> --http-port 8899 --no-serve
 ```
 
 The robot then fetches the script from the public host and beacons back to
