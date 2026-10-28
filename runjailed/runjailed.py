@@ -37,7 +37,11 @@ RUNJAILED_HOME = "/data/opt/irobot/persistent/opt/runjailed"
 AVAILABLE_CMD_SPACE = 1
 
 def sendCmd(cmd: str):
-    """Publish the raw string as state.sdiscUrl on topic wifictl.
+    """Publish the raw string as state.sdiscUrl on topic delta.
+
+    local_manager bridges the external topic ``delta`` to the internal topic
+    ``local/delta``, which connectivity_manager subscribes to. Publishing on
+    ``wifictl`` never reaches the sdiscUrl handler.
 
     True only means Paho accepted the publish locally. It does not confirm
     broker delivery, robot processing, or shell execution.
@@ -46,7 +50,7 @@ def sendCmd(cmd: str):
         raise ValueError("cmd must be a string of at most 191 bytes")
     if mqttc is None:
         raise RuntimeError("MQTT client is not initialized")
-    result = mqttc.publish("wifictl", json.dumps({"state": {"sdiscUrl": cmd}}), qos=1)
+    result = mqttc.publish("delta", json.dumps({"state": {"sdiscUrl": cmd}}), qos=1)
     return result.rc == mqtt.MQTT_ERR_SUCCESS
 
 def sendChunkedCommand(cmd: str, file: str|None = "I", display: str|None = None):

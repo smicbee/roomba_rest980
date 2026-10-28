@@ -46,7 +46,7 @@ def test_send_cmd_publishes_discovery_url_as_json_with_qos_one(url):
     assert module.sendCmd(url) is True
 
     module.mqttc.publish.assert_called_once_with(
-        "wifictl", json.dumps({"state": {"sdiscUrl": url}}), qos=1
+        "delta", json.dumps({"state": {"sdiscUrl": url}}), qos=1
     )
 
 
@@ -59,7 +59,7 @@ def test_send_cmd_preserves_shell_metacharacters_inside_the_url_field():
     assert module.sendCmd(value) is True
 
     module.mqttc.publish.assert_called_once_with(
-        "wifictl", json.dumps({"state": {"sdiscUrl": value}}), qos=1
+        "delta", json.dumps({"state": {"sdiscUrl": value}}), qos=1
     )
 
 
@@ -73,7 +73,7 @@ def test_send_cmd_preserves_json_special_characters_within_firmware_limit():
     assert module.sendCmd(url) is True
 
     args, kwargs = module.mqttc.publish.call_args
-    assert args[0] == "wifictl"
+    assert args[0] == "delta"
     assert json.loads(args[1]) == {"state": {"sdiscUrl": url}}
     assert kwargs == {"qos": 1}
 
