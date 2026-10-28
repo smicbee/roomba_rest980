@@ -85,12 +85,17 @@ def _send_all(client, urls, delay):
     client.disconnect()
 
 def on_message(client, userdata, msg):
-    pl = json.loads(msg.payload)
-    if "shadow/update" in msg.topic:
+    # $SYS/# and other broker traffic is not JSON; a raising callback kills loop_forever().
+    if "shadow/update" not in msg.topic:
+        return
+    try:
+        pl = json.loads(msg.payload)
         robotDat = pl['state']['reported']
-        print("Discovered: " + robotDat['sku'] +" on " + robotDat['softwareVer'])
-        
-        print("Automatic jailbreak workflow is disabled: sendCmd only configures a discovery URL.")
+    except (ValueError, KeyError, TypeError):
+        return
+    print("Discovered: " + robotDat.get('sku', '?') + " on " + robotDat.get('softwareVer', '?'))
+
+    print("Automatic jailbreak workflow is disabled: sendCmd only configures a discovery URL.")
 
 class RunjailedHTTPHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args): pass

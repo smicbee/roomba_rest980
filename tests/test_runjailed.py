@@ -168,3 +168,13 @@ def test_on_connect_publishes_pending_urls_once_and_disconnects():
     assert module.mqttc.publish.call_count == 2
     assert module.PENDING_URLS == []
     client.disconnect.assert_called_once()
+
+
+def test_on_message_ignores_non_json_payloads_and_other_topics():
+    module = load_script()
+    module.mqttc = Mock(spec=mqtt.Client)
+
+    module.on_message(module.mqttc, None, SimpleNamespace(topic="$SYS/broker/uptime", payload=b"120 seconds"))
+    module.on_message(module.mqttc, None, SimpleNamespace(topic="$aws/things/x/shadow/update", payload=b"not json"))
+
+    module.mqttc.publish.assert_not_called()
