@@ -50,7 +50,8 @@ def sendCmd(cmd: str):
         raise ValueError("cmd must be a string of at most 191 bytes")
     if mqttc is None:
         raise RuntimeError("MQTT client is not initialized")
-    result = mqttc.publish("delta", json.dumps({"state": {"sdiscUrl": cmd}}), qos=1)
+    # local_manager accepts only fixed header 0x30: QoS 0, no RETAIN/DUP.
+    result = mqttc.publish("delta", json.dumps({"state": {"sdiscUrl": cmd}}), qos=0, retain=False)
     return result.rc == mqtt.MQTT_ERR_SUCCESS
 
 def sendChunkedCommand(cmd: str, file: str|None = "I", display: str|None = None):

@@ -38,7 +38,7 @@ def test_import_does_not_parse_arguments_or_start_network_services():
 
 
 @pytest.mark.parametrize("url", ["http://example.org", "https://example.org"])
-def test_send_cmd_publishes_discovery_url_as_json_with_qos_one(url):
+def test_send_cmd_publishes_discovery_url_as_json_with_qos_zero_without_retain(url):
     module = load_script()
     module.mqttc = Mock(spec=mqtt.Client)
     module.mqttc.publish.return_value = SimpleNamespace(rc=mqtt.MQTT_ERR_SUCCESS)
@@ -46,7 +46,7 @@ def test_send_cmd_publishes_discovery_url_as_json_with_qos_one(url):
     assert module.sendCmd(url) is True
 
     module.mqttc.publish.assert_called_once_with(
-        "delta", json.dumps({"state": {"sdiscUrl": url}}), qos=1
+        "delta", json.dumps({"state": {"sdiscUrl": url}}), qos=0, retain=False
     )
 
 
@@ -59,7 +59,7 @@ def test_send_cmd_preserves_shell_metacharacters_inside_the_url_field():
     assert module.sendCmd(value) is True
 
     module.mqttc.publish.assert_called_once_with(
-        "delta", json.dumps({"state": {"sdiscUrl": value}}), qos=1
+        "delta", json.dumps({"state": {"sdiscUrl": value}}), qos=0, retain=False
     )
 
 
@@ -75,7 +75,7 @@ def test_send_cmd_preserves_json_special_characters_within_firmware_limit():
     args, kwargs = module.mqttc.publish.call_args
     assert args[0] == "delta"
     assert json.loads(args[1]) == {"state": {"sdiscUrl": url}}
-    assert kwargs == {"qos": 1}
+    assert kwargs == {"qos": 0, "retain": False}
 
 
 @pytest.mark.parametrize("value", [None, 123, "x" * 192])
