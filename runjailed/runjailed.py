@@ -1,15 +1,16 @@
-from http.server import HTTPServer, BaseHTTPRequestHandler
-
 import argparse
 import json
+import math
 import os
 import socket
 import ssl
 import sys
 import threading
-import time
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from typing import cast
 
 import paho.mqtt.client as mqtt
+from paho.mqtt.enums import CallbackAPIVersion
 
 # connectivity_manager rejects any sdiscUrl longer than this (cmp r0,0xbf at 0x101d0).
 SDISCURL_MAX_BYTES = 191
@@ -29,9 +30,9 @@ httpd : HTTPServer|None = None
 
 LOCAL_IP = None
 mqttc = None
-PENDING_URLS: list[str] = []
-SEND_DELAY = 1.5
-LINGER = 15.0
+CONNECT_TIMEOUT = 10.0
+PUBLISH_TIMEOUT = 5.0
+CLEANUP_TIMEOUT = 1.0
 DELTA = "delta"
 RUNJAILED_HOME = "/data/opt/irobot/persistent/opt/runjailed"
 AVAILABLE_CMD_SPACE = 1
@@ -46,13 +47,17 @@ def sendCmd(cmd: str):
     True only means Paho accepted the publish locally. It does not confirm
     broker delivery, robot processing, or shell execution.
     """
-    if not isinstance(cmd, str) or len(cmd.encode()) > 191:
+    return _publish_cmd(cmd).rc == mqtt.MQTT_ERR_SUCCESS
+
+
+def _publish_cmd(cmd: str):
+    """Keep MQTTMessageInfo so the CLI can wait for the complete local send."""
+    if not isinstance(cmd, str) or len(cmd.encode()) > SDISCURL_MAX_BYTES:
         raise ValueError("cmd must be a string of at most 191 bytes")
     if mqttc is None:
         raise RuntimeError("MQTT client is not initialized")
     # local_manager accepts only fixed header 0x30: QoS 0, no RETAIN/DUP.
-    result = mqttc.publish("delta", json.dumps({"state": {"sdiscUrl": cmd}}), qos=0, retain=False)
-    return result.rc == mqtt.MQTT_ERR_SUCCESS
+    return mqttc.publish("delta", json.dumps({"state": {"sdiscUrl": cmd}}), qos=0, retain=False)
 
 def sendChunkedCommand(cmd: str, file: str|None = "I", display: str|None = None):
     raise NotImplementedError("Shell commands are unsupported: sendCmd only configures a discovery URL")
@@ -80,30 +85,38 @@ def enableSshUrl(host: str, port: int = 8899, beacon_port: int = 8883,
     return url
 
 
+class ConnectionState:
+    def __init__(self):
+        self.connack = threading.Event()
+        self.disconnected = threading.Event()
+        self.accepted = False
+        self.error = None
+
+
 def on_connect(client, userdata, flags, reason_code, properties):
-    print("Connected successfully!", flush=True)
-    client.subscribe("$SYS/#")
-    if PENDING_URLS:
-        urls, PENDING_URLS[:] = list(PENDING_URLS), []
-        threading.Thread(target=_send_all, args=(client, urls, SEND_DELAY), daemon=True).start()
+    userdata.accepted = reason_code == 0
+    if userdata.accepted:
+        print("Connected successfully!", flush=True)
+        client.subscribe("$SYS/#")
+    else:
+        userdata.error = f"MQTT connection rejected: {reason_code}"
+    userdata.connack.set()
 
 
-def _send_all(client, urls, delay):
-    for url in urls:
-        try:
-            ok = sendCmd(url)
-            print(f"sendCmd rc={ok} bytes={len(url.encode())}: {url}", flush=True)
-        except (ValueError, RuntimeError) as exc:
-            print(f"sendCmd failed for {url!r}: {exc}", flush=True)
-        time.sleep(delay)
-    # The beacon HTTP server lives in this process: stay up until the robot reports back.
-    if LINGER:
-        print(f"listening for beacons for {LINGER:g}s ...", flush=True)
-        time.sleep(LINGER)
-    client.disconnect()
+def on_disconnect(client, userdata, disconnect_flags, reason_code, properties):
+    userdata.error = f"MQTT disconnected: {reason_code}"
+    userdata.disconnected.set()
+    # Wake the initial waiter even if no CONNACK arrived.
+    userdata.connack.set()
+
+
+def _check_connection(state):
+    if state.disconnected.is_set():
+        raise RuntimeError(state.error or "MQTT disconnected")
+
 
 def on_message(client, userdata, msg):
-    # $SYS/# and other broker traffic is not JSON; a raising callback kills loop_forever().
+    # $SYS/# and other broker traffic is not JSON; do not kill the network loop.
     if "shadow/update" not in msg.topic:
         return
     try:
@@ -148,7 +161,7 @@ class RunjailedHTTPHandler(BaseHTTPRequestHandler):
           print(f"[SUCCESS] Downloaded roomba::unjailed v{ver} to Roomba.")
 
 def main():
-    global LOCAL_IP, httpd, mqttc, SEND_DELAY, LINGER
+    global LOCAL_IP, httpd, mqttc
     # Redirected stdout is block-buffered, which hides progress from callers polling the log.
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(line_buffering=True)
@@ -172,6 +185,10 @@ def main():
                         help="seconds to keep the beacon server up after sending (default 15)")
 
     args = parser.parse_args()
+    for name in ("send_delay", "linger"):
+        value = getattr(args, name)
+        if not math.isfinite(value) or value < 0:
+            parser.error(f"--{name.replace('_', '-')} must be finite and nonnegative")
     if not args.blid:
         parser.error("--blid is required (or set ROOMBA_BLID)")
     if not args.password:
@@ -191,21 +208,74 @@ def main():
     t = threading.Thread(target=httpd.serve_forever, daemon=True)
     t.start()
 
-    mqttc = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
+    state = ConnectionState()
+    mqttc = mqtt.Client(CallbackAPIVersion.VERSION2, userdata=state,
+                        reconnect_on_failure=False)
     mqttc.on_connect = on_connect
     mqttc.on_message = on_message
-    PENDING_URLS[:] = urls
-    SEND_DELAY = args.send_delay
-    LINGER = args.linger
-
-    mqttc.tls_set(cert_reqs=ssl.CERT_NONE)
-    mqttc.tls_insecure_set(True) # The certificate is now expired. Expired on Dec 31 2025.
-
-    mqttc.username_pw_set(args.blid,args.password)
-    mqttc.connect(args.ip, 8883, 60)
-
-    mqttc.loop_forever()
+    mqttc.on_disconnect = on_disconnect
+    started = False
+    try:
+        mqttc.tls_set(cert_reqs=ssl.CERT_NONE)
+        mqttc.tls_insecure_set(True) # Firmware certificate expired on Dec 31 2025.
+        mqttc.username_pw_set(args.blid, args.password)
+        mqttc.connect_timeout = CONNECT_TIMEOUT
+        if mqttc.connect(args.ip, 8883, 60) != mqtt.MQTT_ERR_SUCCESS:
+            raise RuntimeError("MQTT connect failed")
+        if mqttc.loop_start() != mqtt.MQTT_ERR_SUCCESS:
+            raise RuntimeError("MQTT network loop failed to start")
+        started = True
+        if not state.connack.wait(CONNECT_TIMEOUT):
+            raise TimeoutError("MQTT CONNACK timed out")
+        if not state.accepted:
+            raise RuntimeError(state.error or "MQTT connection rejected")
+        _check_connection(state)
+        if not urls:
+            # Preserve the original passive CLI mode when no send was requested.
+            state.disconnected.wait()
+            _check_connection(state)
+        for index, url in enumerate(urls):
+            _check_connection(state)
+            info = _publish_cmd(url)
+            if info.rc != mqtt.MQTT_ERR_SUCCESS:
+                raise RuntimeError(f"MQTT publish failed: rc={info.rc}")
+            info.wait_for_publish(timeout=PUBLISH_TIMEOUT)
+            if not info.is_published():
+                raise TimeoutError("MQTT local send timed out")
+            _check_connection(state)
+            print(f"sendCmd locally sent bytes={len(url.encode())}: {url}", flush=True)
+            if index + 1 < len(urls):
+                state.disconnected.wait(args.send_delay)
+                _check_connection(state)
+        # QoS 0 confirms only local socket send, not broker/robot processing.
+        if args.linger:
+            print(f"listening for beacons for {args.linger:g}s ...", flush=True)
+            state.disconnected.wait(args.linger)
+        _check_connection(state)
+        return 0
+    except (OSError, ValueError, RuntimeError) as exc:
+        print(f"MQTT failed: {exc}", file=sys.stderr, flush=True)
+        return 1
+    finally:
+        try:
+            mqttc.disconnect()
+        finally:
+            try:
+                if started:
+                    sock = cast(socket.socket | None, mqttc.socket())
+                    if sock is not None and not state.disconnected.wait(CLEANUP_TIMEOUT):
+                        # loop_stop joins Paho, which otherwise keeps draining an
+                        # unwritable queue. Unblock its select/read on timeout.
+                        try:
+                            sock.shutdown(socket.SHUT_RDWR)
+                        except OSError:
+                            pass  # The network loop may already have closed it.
+                    mqttc.loop_stop()
+            finally:
+                httpd.shutdown()
+                httpd.server_close()
+                t.join()
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

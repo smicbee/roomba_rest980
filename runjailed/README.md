@@ -82,6 +82,41 @@ the double quotes do not stop `$(...)`, so the command runs before the URL is
 validated. Same process, same 191-byte limit for every manual send:
 `runjailed.py --send '<url>'` or `--enable-ssh HOST[:PORT]`.
 
+## MQTT lifecycle regression checks (offline)
+
+`runjailed.py` uses Paho's `loop_start()` thread as the network writer. The main
+thread publishes only after a successful CONNACK and retains each
+`MQTTMessageInfo` until `wait_for_publish(timeout=5)` and `is_published()` confirm
+its complete **local socket send**. QoS 0 has no broker acknowledgement: this
+is not proof of robot processing, script execution, root access, or working SSH.
+The topic (`delta`), `state.sdiscUrl` JSON, and QoS 0/non-retained header (`0x30`)
+are unchanged. The public `sendCmd()` helper still returns a local-enqueue bool.
+
+TCP/TLS connection establishment uses Paho's 10-second connect timeout, followed
+by a separate 10-second CONNACK limit. Use a numeric robot IP as documented;
+OS hostname resolution is not covered by Paho's socket timeout. Authentication,
+disconnect, enqueue, and local-send failures terminate nonzero without reconnect
+or publish retries. Send delays and beacon linger must be finite and nonnegative.
+Cleanup disconnects, allows up to one second for graceful network shutdown, then
+unblocks a stalled socket before joining the Paho loop. The HTTP beacon server is
+also shut down. Without `--send`/`--enable-ssh`, passive monitoring remains active
+until disconnect or interruption.
+
+Run the suite from the repository root with a Python environment containing
+`pytest` and `runjailed/requirements.txt`:
+
+```sh
+python -m pytest -q
+```
+
+The real-Paho regression uses only an in-process socketpair, not TLS, a TCP
+listener, or a robot. It caps writes at three bytes and pauses a partial
+SUBSCRIBE while the main thread queues PUBLISH. It checks one network writer and
+byte-exact, noninterleaved SUBSCRIBE/PUBLISH/DISCONNECT packets. Additional real
+Paho cases cover rejected authentication, missing CONNACK, peer loss, and a
+permanently unwritable publish (including bounded cleanup); CLI tests cover
+failure exits, delays, credentials from the environment, and legacy options.
+
 ## Scripts
 
 > `runjailed` and these scripts assume you already have obtained root access. Note that you can perform most of the scripts anyways using the BusyBox SUID script, but it's better to have root anyway.
